@@ -2,244 +2,370 @@ package splunk
 
 import (
 	"bytes"
-	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
-	"time"
 )
 
-func TestNewClient(t *testing.T) {
-	_, err := NewClient("http://localhost", "", "", "")
-	if err == nil {
-		t.Error("expected error when no credentials are provided")
-	}
-
-	client, err := NewClient("http://localhost", "user", "pass", "")
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if client.Username != "user" {
-		t.Error("username not set correctly")
-	}
-
-	client, err = NewClient("http://localhost", "", "", "token123")
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if client.Token != "token123" {
-		t.Error("token not set correctly")
-	}
+// mockRoundTripper implements http.RoundTripper for mocking HTTP requests.
+type mockRoundTripper struct {
+	fn func(req *http.Request) *http.Response
 }
 
-func TestSetAuthHeader_Token(t *testing.T) {
-	req, _ := http.NewRequest("GET", "http://localhost", nil)
-	c := &Client{Token: "abc123"}
-	err := c.setAuthHeader(req)
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if got := req.Header.Get("Authorization"); got != "Bearer abc123" {
-		t.Errorf("expected Bearer token, got %s", got)
-	}
+func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m.fn(req), nil
 }
 
-func TestSetAuthHeader_BasicAuth(t *testing.T) {
-	req, _ := http.NewRequest("GET", "http://localhost", nil)
-	c := &Client{Username: "user", Password: "pass"}
-	err := c.setAuthHeader(req)
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	username, password, ok := req.BasicAuth()
-	if !ok || username != "user" || password != "pass" {
-		t.Error("basic auth not set correctly")
-	}
+// mockErrorRoundTripper simulates an error on Do.
+type mockErrorRoundTripper struct{}
+
+func (m *mockErrorRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return nil, errors.New("network error")
 }
 
-func TestSetAuthHeader_NoAuth(t *testing.T) {
-	req, _ := http.NewRequest("GET", "http://localhost", nil)
-	c := &Client{}
-	err := c.setAuthHeader(req)
-	if err == nil {
-		t.Error("expected error when no credentials are set")
-	}
-}
-
-func TestPrepareHttpRequest(t *testing.T) {
-	c := &Client{BaseURL: "http://localhost", Token: "tok"}
-	req, err := c.prepareHttpRequest("search index=_internal")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if req.Method != "POST" {
-		t.Error("expected POST method")
-	}
-	if req.Header.Get("Authorization") != "Bearer tok" {
-		t.Error("expected Authorization header")
-	}
-}
-
-func TestParseSplunkSearchResults(t *testing.T) {
-	body := `{"results":[{"field":"value"}]}`
-	r := bytes.NewReader([]byte(body))
-	result, err := parseSplunkSearchResults(r)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	results, ok := result["results"].([]any)
-	if !ok || len(results) != 1 {
-		t.Error("failed to parse results")
+func newTestClient(rt http.RoundTripper) *Client {
+	return &Client{
+		BaseURL:    "http://localhost:8089",
+		Username:   "user",
+		Password:   "pass",
+		Token:      "",
+		HTTPClient: &http.Client{Transport: rt},
 	}
 }
 
 func TestSearch_Success(t *testing.T) {
-	// Mock Splunk search endpoint
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		io.WriteString(w, `{"results":[{"foo":"bar"}]}`)
-	}
-	server := httptest.NewServer(http.HandlerFunc(handler))
-	defer server.Close()
+	mockResp := `{"results":[{"field":"value"}]}`
+	client := newTestClient(&mockRoundTripper{
+		fn: func(req *http.Request) *http.Response {
+			// Check method and URL
+			if req.Method != "POST" {
+				t.Errorf("expected POST, got %s", req.Method)
+			}
+			if req.URL.Path != "/services/search/jobs" {
+				t.Errorf("unexpected path: %s", req.URL.Path)
+			}
+			// Check Content-Type
+			if req.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
+				t.Errorf("unexpected Content-Type: %s", req.Header.Get("Content-Type"))
+			}
+			// Check body
+			body, _ := io.ReadAll(req.Body)
+			if !bytes.Contains(body, []byte("search=something")) {
+				t.Errorf("body missing search param: %s", string(body))
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString(mockResp)),
+				Header:     make(http.Header),
+			}
+		},
+	})
 
-	client, _ := NewClient(server.URL, "user", "pass", "")
-	client.HTTPClient = server.Client()
-
-	result, err := client.Search("search index=_internal")
+	result, err := client.Search("something")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	results, ok := result["results"].([]any)
 	if !ok || len(results) != 1 {
-		t.Error("unexpected search results")
+		t.Fatalf("unexpected results: %v", result)
 	}
 }
 
-func TestSearch_Failure(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, "bad request")
+func TestSearch_WithOptions(t *testing.T) {
+	client := newTestClient(&mockRoundTripper{
+		fn: func(req *http.Request) *http.Response {
+			body, _ := io.ReadAll(req.Body)
+			b := string(body)
+			if !strings.Contains(b, "exec_mode=blocking") {
+				t.Errorf("expected exec_mode=blocking, got %s", b)
+			}
+			if !strings.Contains(b, "earliest_time=1") {
+				t.Errorf("expected earliest_time=1, got %s", b)
+			}
+			if !strings.Contains(b, "latest_time=2") {
+				t.Errorf("expected latest_time=2, got %s", b)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString(`{"results":[]}`)),
+				Header:     make(http.Header),
+			}
+		},
+	})
+
+	_, err := client.Search("foo", "exec_mode=blocking", "earliest_time=1", "latest_time=2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	server := httptest.NewServer(http.HandlerFunc(handler))
-	defer server.Close()
+}
 
-	client, _ := NewClient(server.URL, "user", "pass", "")
-	client.HTTPClient = server.Client()
+func TestSearch_InvalidOptionFormat(t *testing.T) {
+	client := newTestClient(&mockRoundTripper{
+		fn: func(req *http.Request) *http.Response {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString(`{"results":[]}`)),
+				Header:     make(http.Header),
+			}
+		},
+	})
 
-	_, err := client.Search("search index=_internal")
+	_, err := client.Search("foo", "invalidoption")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSearch_AuthHeaderError(t *testing.T) {
+	client := &Client{
+		BaseURL:    "http://localhost:8089",
+		Username:   "",
+		Password:   "",
+		Token:      "",
+		HTTPClient: &http.Client{},
+	}
+	_, err := client.Search("foo")
+	if err == nil || !strings.Contains(err.Error(), "no authentication credentials") {
+		t.Fatalf("expected auth error, got %v", err)
+	}
+}
+
+func TestSearch_RequestError(t *testing.T) {
+	client := &Client{
+		BaseURL:    "http://localhost:8089",
+		Username:   "user",
+		Password:   "pass",
+		Token:      "",
+		HTTPClient: &http.Client{Transport: &mockErrorRoundTripper{}},
+	}
+	_, err := client.Search("foo")
+	if err == nil || !strings.Contains(err.Error(), "network error") {
+		t.Fatalf("expected network error, got %v", err)
+	}
+}
+
+func TestSearch_NonOKStatus(t *testing.T) {
+	client := newTestClient(&mockRoundTripper{
+		fn: func(req *http.Request) *http.Response {
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Status:     "400 Bad Request",
+				Body:       io.NopCloser(bytes.NewBufferString("bad request")),
+				Header:     make(http.Header),
+			}
+		},
+	})
+	_, err := client.Search("foo")
+	if err == nil || !strings.Contains(err.Error(), "search request failed") {
+		t.Fatalf("expected search request failed error, got %v", err)
+	}
+}
+
+func TestSearch_InvalidJSONResponse(t *testing.T) {
+	client := newTestClient(&mockRoundTripper{
+		fn: func(req *http.Request) *http.Response {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(bytes.NewBufferString("not json")),
+				Header:     make(http.Header),
+			}
+		},
+	})
+	_, err := client.Search("foo")
 	if err == nil {
-		t.Error("expected error on bad status")
+		t.Fatalf("expected JSON decode error, got nil")
 	}
 }
-
 func TestSendEvents_Success(t *testing.T) {
-	var received []map[string]any
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Splunk token123" {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		var payload map[string]any
-		json.NewDecoder(r.Body).Decode(&payload)
-		received = append(received, payload)
-		w.WriteHeader(http.StatusOK)
+	var called int
+	client := &Client{
+		BaseURL: "http://localhost:8089",
+		Token:   "test-token",
+		HTTPClient: &http.Client{
+			Transport: &mockRoundTripper{
+				fn: func(req *http.Request) *http.Response {
+					called++
+					// Check URL
+					if req.URL.Path != "/services/collector/event" {
+						t.Errorf("unexpected path: %s", req.URL.Path)
+					}
+					// Check method
+					if req.Method != "POST" {
+						t.Errorf("expected POST, got %s", req.Method)
+					}
+					// Check headers
+					if req.Header.Get("Authorization") != "Splunk test-token" {
+						t.Errorf("unexpected Authorization header: %s", req.Header.Get("Authorization"))
+					}
+					if req.Header.Get("Content-Type") != "application/json" {
+						t.Errorf("unexpected Content-Type: %s", req.Header.Get("Content-Type"))
+					}
+					// Check body
+					body, _ := io.ReadAll(req.Body)
+					if !bytes.Contains(body, []byte(`"index":"main"`)) {
+						t.Errorf("body missing index: %s", string(body))
+					}
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(bytes.NewBufferString(`{"text":"Success"}`)),
+						Header:     make(http.Header),
+					}
+				},
+			},
+		},
 	}
-	server := httptest.NewServer(http.HandlerFunc(handler))
-	defer server.Close()
-
-	client, _ := NewClient(server.URL, "", "", "token123")
-	client.HTTPClient = server.Client()
-
 	events := []Event{
-		{Time: time.Now().Unix(), Event: map[string]any{"foo": "bar"}},
+		{Time: 1234567890, Event: map[string]any{"foo": "bar"}},
+		{Time: 1234567891, Event: map[string]any{"baz": "qux"}},
 	}
 	err := client.SendEvents("main", events)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(received) != 1 {
-		t.Error("event not received")
-	}
-	if received[0]["index"] != "main" {
-		t.Error("index not set correctly")
+	if called != len(events) {
+		t.Errorf("expected %d calls, got %d", len(events), called)
 	}
 }
 
 func TestSendEvents_NoToken(t *testing.T) {
-	client, _ := NewClient("http://localhost", "user", "pass", "")
-	err := client.SendEvents("main", []Event{{Time: 1, Event: map[string]any{}}})
-	if err == nil {
-		t.Error("expected error when no token is set")
+	client := &Client{
+		BaseURL:    "http://localhost:8089",
+		Token:      "",
+		HTTPClient: &http.Client{},
 	}
-}
-
-func TestSendEvents_Failure(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "fail", http.StatusBadRequest)
-	}
-	server := httptest.NewServer(http.HandlerFunc(handler))
-	defer server.Close()
-
-	client, _ := NewClient(server.URL, "", "", "token123")
-	client.HTTPClient = server.Client()
-
-	events := []Event{
-		{Time: time.Now().Unix(), Event: map[string]any{"foo": "bar"}},
-	}
+	events := []Event{{Time: 1, Event: map[string]any{"foo": "bar"}}}
 	err := client.SendEvents("main", events)
-	if err == nil {
-		t.Error("expected error on failed send")
+	if err == nil || !strings.Contains(err.Error(), "HEC requires a token") {
+		t.Fatalf("expected HEC requires a token error, got %v", err)
 	}
 }
 
 func TestSendEvents_MarshalError(t *testing.T) {
-	client, _ := NewClient("http://localhost", "", "", "token123")
-	client.HTTPClient = &http.Client{}
-	// Event.Event contains a channel, which cannot be marshaled to JSON
+	client := &Client{
+		BaseURL: "http://localhost:8089",
+		Token:   "test-token",
+		HTTPClient: &http.Client{
+			Transport: &mockRoundTripper{
+				fn: func(req *http.Request) *http.Response {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(bytes.NewBufferString(`ok`)),
+						Header:     make(http.Header),
+					}
+				},
+			},
+		},
+	}
+	// json.Marshal fails on channel type
 	events := []Event{
 		{Time: 1, Event: map[string]any{"bad": make(chan int)}},
 	}
 	err := client.SendEvents("main", events)
-	if err == nil {
-		t.Error("expected marshal error")
+	if err == nil || !strings.Contains(err.Error(), "failed to marshal event") {
+		t.Fatalf("expected marshal error, got %v", err)
 	}
 }
 
 func TestSendEvents_RequestError(t *testing.T) {
-	client, _ := NewClient("http://localhost", "", "", "token123")
-	client.HTTPClient = &http.Client{}
-	// Invalid URL to force request creation error
-	client.BaseURL = "http://[::1]:NamedPort"
-	events := []Event{
-		{Time: 1, Event: map[string]any{"foo": "bar"}},
+	client := &Client{
+		BaseURL: "http://localhost:8089",
+		Token:   "test-token",
+		HTTPClient: &http.Client{
+			Transport: &mockErrorRoundTripper{},
+		},
 	}
+	events := []Event{{Time: 1, Event: map[string]any{"foo": "bar"}}}
 	err := client.SendEvents("main", events)
-	if err == nil {
-		t.Error("expected error on request creation")
+	if err == nil || !strings.Contains(err.Error(), "failed to send event") {
+		t.Fatalf("expected failed to send event error, got %v", err)
 	}
 }
 
-func TestSendEvents_DoError(t *testing.T) {
-	client, _ := NewClient("http://localhost", "", "", "token123")
-	client.HTTPClient = &http.Client{
-		Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
-			return nil, fmt.Errorf("network error")
-		}),
+func TestSendEvents_NonOKStatus(t *testing.T) {
+	client := &Client{
+		BaseURL: "http://localhost:8089",
+		Token:   "test-token",
+		HTTPClient: &http.Client{
+			Transport: &mockRoundTripper{
+				fn: func(req *http.Request) *http.Response {
+					return &http.Response{
+						StatusCode: http.StatusBadRequest,
+						Status:     "400 Bad Request",
+						Body:       io.NopCloser(bytes.NewBufferString("bad request")),
+						Header:     make(http.Header),
+					}
+				},
+			},
+		},
 	}
-	events := []Event{
-		{Time: 1, Event: map[string]any{"foo": "bar"}},
-	}
+	events := []Event{{Time: 1, Event: map[string]any{"foo": "bar"}}}
 	err := client.SendEvents("main", events)
-	if err == nil {
-		t.Error("expected error on HTTP Do")
+	if err == nil || !strings.Contains(err.Error(), "failed to send event: 400 Bad Request") {
+		t.Fatalf("expected failed to send event error, got %v", err)
+	}
+}
+func TestSetAuthHeader_WithToken(t *testing.T) {
+	client := &Client{
+		Token: "my-token",
+	}
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	err := client.setAuthHeader(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	auth := req.Header.Get("Authorization")
+	if auth != "Bearer my-token" {
+		t.Errorf("expected Authorization 'Bearer my-token', got '%s'", auth)
 	}
 }
 
-// roundTripperFunc is a helper to mock http.RoundTripper
-type roundTripperFunc func(*http.Request) (*http.Response, error)
+func TestSetAuthHeader_WithUsernamePassword(t *testing.T) {
+	client := &Client{
+		Username: "user",
+		Password: "pass",
+	}
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	err := client.setAuthHeader(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	username, password, ok := req.BasicAuth()
+	if !ok {
+		t.Errorf("expected basic auth to be set")
+	}
+	if username != "user" || password != "pass" {
+		t.Errorf("expected basic auth user/pass to be set, got %s/%s", username, password)
+	}
+}
 
-func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
-	return f(r)
+func TestSetAuthHeader_NoCredentials(t *testing.T) {
+	client := &Client{}
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	err := client.setAuthHeader(req)
+	if err == nil || err.Error() != "no authentication credentials provided" {
+		t.Errorf("expected error for missing credentials, got %v", err)
+	}
+}
+
+func TestSetAuthHeader_TokenTakesPrecedence(t *testing.T) {
+	client := &Client{
+		Token:    "token123",
+		Username: "user",
+		Password: "pass",
+	}
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	err := client.setAuthHeader(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	auth := req.Header.Get("Authorization")
+	if auth != "Bearer token123" {
+		t.Errorf("expected Authorization 'Bearer token123', got '%s'", auth)
+	}
+	username, password, ok := req.BasicAuth()
+	if ok && (username != "" || password != "") {
+		t.Errorf("expected no basic auth when token is set")
+	}
 }

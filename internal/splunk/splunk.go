@@ -42,9 +42,61 @@ func NewClient(baseURL string, username, password, token string) (*Client, error
 	}, nil
 }
 
-func (c *Client) Search(query string) (map[string]any, error) {
-	req, err := c.prepareHttpRequest(query)
+// Search executes a search query against the Splunk service using the provided query string and parameters.
+// Parameters:
+//   - query: The Splunk search query to execute.
+//   - index: The Splunk index to search (mandatory).
+//   - options: Optional parameters as varargs in the format "parameter_name=value" (e.g., "exec_mode=normal").
+//
+// Supported optional parameters: exec_mode (default "normal"), earliest_time, latest_time.
+//
+// Returns:
+//   - map[string]any: The parsed search results.
+//   - error: An error if the search request fails or the response cannot be parsed.
+func (c *Client) Search(query string, options ...string) (map[string]any, error) {
+	// Set defaults
+	execMode := "normal"
+	earliestTime := ""
+	latestTime := ""
+
+	// Parse options
+	for _, opt := range options {
+		parts := strings.SplitN(opt, "=", 2)
+		if len(parts) != 2 {
+			continue // skip invalid option
+		}
+		key, value := parts[0], parts[1]
+		switch key {
+		case "exec_mode":
+			execMode = value
+		case "earliest_time":
+			earliestTime = value
+		case "latest_time":
+			latestTime = value
+		}
+	}
+
+	searchURL := c.BaseURL + "/services/search/jobs"
+	params := []string{
+		fmt.Sprintf("search=%s", query),
+		fmt.Sprintf("exec_mode=%s", execMode),
+		"output_mode=json",
+	}
+	if earliestTime != "" {
+		params = append(params, fmt.Sprintf("earliest_time=%s", earliestTime))
+	}
+	if latestTime != "" {
+		params = append(params, fmt.Sprintf("latest_time=%s", latestTime))
+	}
+	reqBody := strings.Join(params, "&")
+
+	req, err := http.NewRequest("POST", searchURL, strings.NewReader(reqBody))
 	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	if err := c.setAuthHeader(req); err != nil {
 		return nil, err
 	}
 
@@ -99,23 +151,6 @@ func (c *Client) SendEvents(indexName string, events []Event) error {
 	}
 	return nil
 
-}
-
-// prepareHttpRequest prepares the HTTP request for a Splunk search job.
-func (c *Client) prepareHttpRequest(query string) (*http.Request, error) {
-	searchURL := c.BaseURL + "/services/search/jobs"
-	reqBody := fmt.Sprintf("search=%s&exec_mode=oneshot&output_mode=json", query)
-
-	req, err := http.NewRequest("POST", searchURL, strings.NewReader(reqBody))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	if err := c.setAuthHeader(req); err != nil {
-		return nil, err
-	}
-	return req, nil
 }
 
 // setAuthHeader sets the appropriate authentication header for the request.
