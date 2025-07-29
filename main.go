@@ -43,24 +43,7 @@ func NewClient(baseURL string, username, password, token string) (*Client, error
 	}, nil
 }
 
-// prepareHttpRequest prepares the HTTP request for a Splunk search job.
-func (c *Client) prepareHttpRequest(query string) (*http.Request, error) {
-	searchURL := c.BaseURL + "/services/search/jobs"
-	reqBody := fmt.Sprintf("search=%s&exec_mode=oneshot&output_mode=json", query)
-
-	req, err := http.NewRequest("POST", searchURL, strings.NewReader(reqBody))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	if err := c.setAuthHeader(req); err != nil {
-		return nil, err
-	}
-	return req, nil
-}
-
-func (c *Client) Search(query string) ([]any, error) {
+func (c *Client) Search(query string) (map[string]any, error) {
 	req, err := c.prepareHttpRequest(query)
 	if err != nil {
 		return nil, err
@@ -85,6 +68,23 @@ func (c *Client) SendEvents(indexName string, events []Event) error {
 	return nil
 }
 
+// prepareHttpRequest prepares the HTTP request for a Splunk search job.
+func (c *Client) prepareHttpRequest(query string) (*http.Request, error) {
+	searchURL := c.BaseURL + "/services/search/jobs"
+	reqBody := fmt.Sprintf("search=%s&exec_mode=oneshot&output_mode=json", query)
+
+	req, err := http.NewRequest("POST", searchURL, strings.NewReader(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	if err := c.setAuthHeader(req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
 // setAuthHeader sets the appropriate authentication header for the request.
 func (c *Client) setAuthHeader(req *http.Request) error {
 	if c.Token != "" {
@@ -99,20 +99,13 @@ func (c *Client) setAuthHeader(req *http.Request) error {
 }
 
 // parseSplunkSearchResults parses the Splunk search results from the response body.
-func parseSplunkSearchResults(body io.Reader) ([]any, error) {
-	var result struct {
-		Results []map[string]any `json:"results"`
-	}
+func parseSplunkSearchResults(body io.Reader) (map[string]any, error) {
+	var result map[string]any
 	decoder := json.NewDecoder(body)
 	if err := decoder.Decode(&result); err != nil {
 		return nil, err
 	}
-	// Convert []map[string]any to []any for compatibility
-	anyResults := make([]any, len(result.Results))
-	for i, v := range result.Results {
-		anyResults[i] = v
-	}
-	return anyResults, nil
+	return result, nil
 }
 
 func main() {
