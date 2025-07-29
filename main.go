@@ -62,9 +62,42 @@ func (c *Client) Search(query string) (map[string]any, error) {
 	return parseSplunkSearchResults(resp.Body)
 }
 
-// SendEvents sends events to a Splunk index.
+// SendEvents sends events to a Splunk index using the HTTP Event Collector (HEC) API.
 func (c *Client) SendEvents(indexName string, events []Event) error {
-	// TODO: Implement the event sending logic
+	if c.Token == "" {
+		return fmt.Errorf("HEC requires a token for authentication")
+	}
+
+	hecURL := strings.TrimRight(c.BaseURL, "/") + "/services/collector/event"
+	for _, event := range events {
+		payload := map[string]any{
+			"index": indexName,
+			"time":  event.Time,
+			"event": event.Event,
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("failed to marshal event: %w", err)
+		}
+
+		req, err := http.NewRequest("POST", hecURL, strings.NewReader(string(body)))
+		if err != nil {
+			return fmt.Errorf("failed to create request: %w", err)
+		}
+		req.Header.Set("Authorization", "Splunk "+c.Token)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.HTTPClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to send event: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to send event: %s - %s", resp.Status, string(respBody))
+		}
+	}
 	return nil
 }
 
