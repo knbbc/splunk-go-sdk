@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
-	"splunk-go-sdk/internal/splunk"
+	"splunk-go-sdk/pkg/splunk"
 )
 
 func main() {
